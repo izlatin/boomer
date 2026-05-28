@@ -99,7 +99,14 @@ proc update(flashlight: var Flashlight, dt: float32) =
   else:
     flashlight.shadow = max(flashlight.shadow - 6.0 * dt, 0.0)
 
-proc draw(screenshot: PXImage, camera: Camera, shader, vao, texture: GLuint,
+proc glFormat(format: PixelFormat): GLenum =
+  case format
+  of pfBGRA:
+    GL_BGRA
+  of pfRGBA:
+    GL_RGBA
+
+proc draw(screenshot: ImageBuffer, camera: Camera, shader, vao, texture: GLuint,
           windowSize: Vec2f, mouse: Mouse, flashlight: Flashlight, mirror: bool) =
   glClearColor(0.1, 0.1, 0.1, 1.0)
   glClear(GL_COLOR_BUFFER_BIT or GL_DEPTH_BUFFER_BIT)
@@ -175,11 +182,37 @@ proc xElevenErrorHandler(display: PDisplay, errorEvent: PXErrorEvent): cint{.cde
   discard XGetErrorText(display, errorEvent.error_code.cint, cast[cstring](addr errorMessage), CAPACITY)
   echo "X ELEVEN ERROR: ", $(cast[cstring](addr errorMessage))
 
+proc parseBackend(value: string): Option[CaptureBackend] =
+  case value.toLowerAscii
+  of "x11":
+    some(cbX11)
+  of "portal", "wayland":
+    some(cbPortal)
+  else:
+    none(CaptureBackend)
+
+proc resolveBackend(requested: Option[CaptureBackend]): CaptureBackend =
+  if requested.isSome:
+    return requested.get()
+
+  let envBackend = getEnv("BOOMER_BACKEND")
+  if envBackend.len > 0:
+    let parsed = parseBackend(envBackend)
+    if parsed.isSome:
+      return parsed.get()
+    else:
+      stderr.writeLine("Unknown BOOMER_BACKEND value: " & envBackend)
+
+  if getEnv("WAYLAND_DISPLAY").len > 0:
+    return cbPortal
+  cbX11
+
 proc main() =
   let boomerDir = getConfigDir() / "boomer"
   var configFile = boomerDir / "config"
   var windowed = false
   var delaySec = 0.0
+  var captureBackend = none(CaptureBackend)
 
   # TODO(#95): Make boomer optionally wait for some kind of event (for example, key press)
   block:
@@ -188,6 +221,7 @@ proc main() =
       quit "boomer-$#" % [if hash.exitCode == 0: hash.output[0 .. 7] else: "unknown"]
     proc usageQuit() =
       quit """Usage: boomer [OPTIONS]
+  -b, --backend <x11|portal>    force screenshot backend (default: portal on Wayland, x11 otherwise)
   -d, --delay <seconds: float>  delay execution of the program by provided <seconds>
   -h, --help                    show this help and exit
       --new-config [filepath]   generate a new default config at [filepath]
@@ -237,6 +271,12 @@ proc main() =
       of "-V", "--version":
         asFlag():
           versionQuit()
+      of "-b", "--backend":
+        asParam(backendParam):
+          captureBackend = parseBackend(backendParam)
+          if captureBackend.isNone:
+            echo "Unknown backend `", backendParam, "`. Expected `x11` or `portal`."
+            usageQuit()
       of "--new-config":
         asOptionalParam(configName):
           let newConfigPath = configName.get(configFile)
@@ -265,6 +305,9 @@ proc main() =
     stderr.writeLine configFile & " doesn't exist. Using default values. "
 
   echo "Using config: ", config
+  let backend = resolveBackend(captureBackend)
+  echo "Capture backend: ",
+       (if backend == cbPortal: "portal (Wayland/portal)" else: "x11")
 
   var display = XOpenDisplay(nil)
   if display == nil:
@@ -351,7 +394,11 @@ proc main() =
 
   var shaderProgram = newShaderProgram(vertexShader, fragmentShader)
 
-  var screenshot = newScreenshot(display, trackingWindow)
+  var screenshot =
+    if backend == cbPortal:
+      newPortalScreenshot()
+    else:
+      newX11Screenshot(display, trackingWindow)
   defer: screenshot.destroy(display)
 
   let w = screenshot.image.width.float32
@@ -401,14 +448,13 @@ proc main() =
 
   glTexImage2D(GL_TEXTURE_2D,
                0,
-               GL_RGB.GLint,
-               screenshot.image.width,
-               screenshot.image.height,
+               GL_RGBA.GLint,
+               screenshot.image.width.GLsizei,
+               screenshot.image.height.GLsizei,
                0,
-               # TODO(#13): the texture format is hardcoded
-               GL_BGRA,
+               glFormat(screenshot.image.pixelFormat),
                GL_UNSIGNED_BYTE,
-               screenshot.image.data)
+               screenshot.image.dataPtr)
   glGenerateMipmap(GL_TEXTURE_2D)
 
   glUniform1i(glGetUniformLocation(shaderProgram, "tex".cstring), 0)
@@ -581,13 +627,13 @@ proc main() =
       glTexImage2D(GL_TEXTURE_2D,
                    0,
                    GL_RGB.GLint,
-                   screenshot.image.width,
-                   screenshot.image.height,
+                   screenshot.image.GLsizei,
+                   screenshot.image.GLsizei,
                    0,
                    # TODO(#13): the texture format is hardcoded
-                   GL_BGRA,
+                   glFormat(screenshot.image.pixelFormat),
                    GL_UNSIGNED_BYTE,
-                   screenshot.image.data)
+                   screenshot.image.dataPtr)
   discard XSetInputFocus(display, originWindow, RevertToParent, CurrentTime);
   discard XSync(display, 0)
 
