@@ -73,6 +73,8 @@ Supported parameters:
 | scroll_speed   | How quickly you can zoom in/out by scrolling       |
 | drag_friction  | How quickly the movement slows down after dragging |
 | scale_friction | How quickly the zoom slows down after scrolling    |
+| offset_x       | Offset for the screenshot (pixels on the right)    |
+| offset_y       | Offset for the screenshot (pixels on top)          |
 
 ## Experimental Features Compilation Flags
 

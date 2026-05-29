@@ -601,7 +601,7 @@ proc main() =
       sdl2.getViewport(renderer, winRect)
       # echo "viewport: ", winRect.x, " ", winRect.y, " ", winRect.w, " ", winRect.h
 
-      glViewport(0, 0, w, h)
+      glViewport(-config.offsetX.cint, -config.offsetY.cint, w, h)
       let windowSize = vec2(w.float32, h.float32)
  
       proc scrollUp() =

@@ -5,12 +5,16 @@ type Config* = object
   scroll_speed*: float
   drag_friction*: float
   scale_friction*: float
+  offset_x*: float
+  offset_y*: float
 
 const defaultConfig* = Config(
   min_scale: 0.01,
   scroll_speed: 1.5,
   drag_friction: 6.0,
   scale_friction: 4.0,
+  offset_x: 0.0,
+  offset_y: 0.0
 )
 
 proc loadConfig*(filePath: string): Config =
@@ -31,6 +35,10 @@ proc loadConfig*(filePath: string): Config =
       result.drag_friction = parseFloat(value)
     of "scale_friction":
       result.scale_friction = parseFloat(value)
+    of "offset_x":
+      result.offset_x = parseFloat(value)
+    of "offset_y":
+      result.offset_y = parseFloat(value)
     else:
       quit "Unknown config key `$#`" % [key]
 
