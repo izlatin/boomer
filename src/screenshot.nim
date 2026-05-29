@@ -124,7 +124,7 @@ proc findPortalCommand(): Option[PortalCommand] =
 
   return none(PortalCommand)
 
-proc captureWithPortal(cmd: PortalCommand): ImageBuffer =
+proc captureWithPortal(cmd: PortalCommand, windowed: bool = false): ImageBuffer =
   case cmd.kind
   of pckGrim:
     let (code, output, _) = execForOutput(cmd.path, @["-"])
@@ -151,17 +151,20 @@ proc captureWithPortal(cmd: PortalCommand): ImageBuffer =
       try: removeFile(tempPath)
       except CatchableError: discard
 
-    let exitCode = execAndWait(cmd.path, @["-b", "-n", "-o", tempPath])
+    var args = @["-b", "-n", "-o", tempPath]
+    if windowed:
+      args.add("-m")
+    let exitCode = execAndWait(cmd.path, args)
     if exitCode != 0 or not fileExists(tempPath):
       raise newException(IOError, "spectacle failed to produce a screenshot.")
     result = loadImageFromBytes(readFile(tempPath).toBytes)
 
-proc newPortalScreenshot*(): Screenshot =
+proc newPortalScreenshot*(windowed: bool): Screenshot =
   let cmd = findPortalCommand()
   if cmd.isNone:
     raise newException(IOError, "No Wayland-friendly screenshot tool found. Install grim (wlr), gnome-screenshot (GNOME) or spectacle (KDE).")
 
-  let image = captureWithPortal(cmd.get())
+  let image = captureWithPortal(cmd.get(), windowed)
   result = Screenshot(
     backend: cbPortal,
     image: image,
@@ -198,7 +201,7 @@ proc newX11Screenshot*(display: PDisplay, window: Window): Screenshot =
   discard XGetWindowAttributes(display, window, addr attributes)
 
   when defined(mitshm):
-    var shminfo = cast[PXShmSegmentInfo](allocShared(sizeof(TXShmSegmentInfo)))
+    var shminfo = cast[PXShmSegmentInfo](allocShared(sizeof(PXShmSegmentInfo)))
     let screen = DefaultScreen(display)
     var ximage = XShmCreateImage(
       display,

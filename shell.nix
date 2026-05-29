@@ -12,10 +12,12 @@ mkShell {
                   libGL
                   libGLU
                   freeglut
+                  SDL2
                 ];
   LD_LIBRARY_PATH = lib.makeLibraryPath [
     "/run/opengl-driver"
     xorg.libX11 xorg.libXrandr xorg.libXext
-    libGL libGLU freeglut
+    libGL libGLU freeglut 
+    SDL2
   ];
 }

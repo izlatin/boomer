@@ -16,6 +16,9 @@ import strutils
 import math
 import options
 
+import sdl2
+# import sdl2/syswm
+
 type Shader = tuple[path, content: string]
 
 proc readShader(file: string): Shader =
@@ -99,7 +102,7 @@ proc update(flashlight: var Flashlight, dt: float32) =
   else:
     flashlight.shadow = max(flashlight.shadow - 6.0 * dt, 0.0)
 
-proc glFormat(format: PixelFormat): GLenum =
+proc glFormat(format: screenshot.PixelFormat): GLenum =
   case format
   of pfBGRA:
     GL_BGRA
@@ -130,6 +133,12 @@ proc draw(screenshot: ImageBuffer, camera: Camera, shader, vao, texture: GLuint,
 
   glBindVertexArray(vao)
   glDrawElements(GL_TRIANGLES, count = 6, GL_UNSIGNED_INT, indices = nil)
+
+proc getCursorPositionSDL(): Vec2f =
+  var x, y: cint
+  discard sdl2.getMouseState(addr x, addr y)
+  result.x = x.float32
+  result.y = y.float32
 
 proc getCursorPosition(display: PDisplay): Vec2f =
   var root, child: Window
@@ -206,6 +215,27 @@ proc resolveBackend(requested: Option[CaptureBackend]): CaptureBackend =
   if getEnv("WAYLAND_DISPLAY").len > 0:
     return cbPortal
   cbX11
+
+proc getWindowGeometrySDL(x, y, w, h: var int) =
+  let count = sdl2.getNumVideoDisplays()
+  var minX = int.high
+  var minY = int.high
+  var maxX = int.low
+  var maxY = int.low
+
+  for i in 0..<count:
+    var r: sdl2.Rect
+    discard sdl2.getDisplayBounds(i.cint, r)
+    minX = min(minX, r.x)
+    minY = min(minY, r.y)
+    maxX = max(maxX, r.x + r.w)
+    maxY = max(maxY, r.y + r.h)
+
+  x = minX
+  y = minY
+  w = maxX - minX
+  h = maxY - minY
+  echo "window geometry: $1 $2 $3 $4" % [$x, $y, $w, $h]
 
 proc main() =
   let boomerDir = getConfigDir() / "boomer"
@@ -309,94 +339,166 @@ proc main() =
   echo "Capture backend: ",
        (if backend == cbPortal: "portal (Wayland/portal)" else: "x11")
 
-  var display = XOpenDisplay(nil)
-  if display == nil:
-    quit "Failed to open display"
-  defer:
-    discard XCloseDisplay(display)
+  var
+    # X11-only
+    display:        PDisplay = nil
+    win:            Window
+    glc:            GLXContext
+    wmDeleteMessage: Atom
+    originWindow:   Window
+    revertToReturn: cint
+    trackingWindow: Window
+ 
+    # SDL2-only
+    sdlWindow:  sdl2.WindowPtr = nil
+    sdlGlCtx:   sdl2.GlContextPtr
+ 
+    # shared
+    rate:  float32
+    winW, winH: int
 
-  discard XSetErrorHandler(xElevenErrorHandler)
+  if backend == cbPortal: # portal / wayland
+    if sdl2.init(INIT_VIDEO) != SdlSuccess:
+      quit "SDL2 init failed: " & $sdl2.getError()
+ 
+    # try wayland or fallback to x11
+    if getEnv("WAYLAND_DISPLAY").len > 0:
+      discard sdl2.setHint("SDL_VIDEODRIVER", "wayland,x11")
+ 
+    discard sdl2.glSetAttribute(SDL_GL_DEPTH_SIZE,    24)
+    discard sdl2.glSetAttribute(SDL_GL_DOUBLEBUFFER,  1)
+    discard sdl2.glSetAttribute(SDL_GL_RED_SIZE,      8)
+    discard sdl2.glSetAttribute(SDL_GL_GREEN_SIZE,    8)
+    discard sdl2.glSetAttribute(SDL_GL_BLUE_SIZE,     8)
 
-  when defined(select):
-    echo "Please select window:"
-    var trackingWindow = selectWindow(display)
+    var dm: sdl2.DisplayMode
+    if sdl2.getDesktopDisplayMode(0, dm) != SdlSuccess:
+      quit "SDL2 getDesktopDisplayMode failed: " & $sdl2.getError()
+    rate = if dm.refresh_rate > 0: dm.refresh_rate.float32 else: 60.0
+
+    # compute bounding box across all outputs
+    var winX, winY = 0
+    if windowed:
+      winW = dm.w
+      winH = dm.h
+    else:
+      getWindowGeometrySDL(winX, winY, winW, winH)
+
+    # SDL_WINDOW_FULLSCREEN_DESKTOP is per-output on Wayland and cannot span
+    # monitors. Use a borderless window at the full desktop geometry instead.
+    let flags =
+      if windowed: SDL_WINDOW_OPENGL or SDL_WINDOW_RESIZABLE
+      else:        SDL_WINDOW_OPENGL or SDL_WINDOW_BORDERLESS
+
+    sdlWindow = sdl2.createWindow(
+      "boomer",
+      winX.cint, winY.cint,
+      winW.cint, winH.cint,
+      flags)
+    if sdlWindow == nil:
+      quit "SDL2 createWindow failed: " & $sdl2.getError()
+ 
+    sdlGlCtx = sdl2.glCreateContext(sdlWindow)
+    if sdlGlCtx == nil:
+      quit "SDL2 glCreateContext failed: " & $sdl2.getError()
+ 
+    discard sdl2.glMakeCurrent(sdlWindow, sdlGlCtx)
+    discard sdl2.glSetSwapInterval(1)   # vsync
+ 
+    loadExtensions()
+
   else:
-    var trackingWindow = DefaultRootWindow(display)
+    display = XOpenDisplay(nil)
+    if display == nil:
+      quit "Failed to open display"
 
-  var screenConfig = XRRGetScreenInfo(display, DefaultRootWindow(display))
-  let rate = XRRConfigCurrentRate(screenConfig)
-  echo "Screen rate: ", rate
+    discard XSetErrorHandler(xElevenErrorHandler)
 
-  let screen = XDefaultScreen(display)
-  var glxMajor, glxMinor: cint
+    when defined(select):
+      echo "Please select window:"
+      trackingWindow = selectWindow(display)
+    else:
+      trackingWindow = DefaultRootWindow(display)
 
-  if (not glXQueryVersion(display, glxMajor, glxMinor).bool or
-      (glxMajor == 1.cint and glxMinor < 3.cint) or
-      (glxMajor < 1.cint)):
-    quit "Invalid GLX version. Expected >=1.3"
-  echo("GLX version ", glxMajor, ".", glxMinor)
-  echo("GLX extension: ", glXQueryExtensionsString(display, screen))
+    var screenConfig = XRRGetScreenInfo(display, DefaultRootWindow(display))
+    rate = XRRConfigCurrentRate(screenConfig).float32
+    echo "Screen rate: ", rate
 
-  var attrs = [
-    GLX_RGBA,
-    GLX_DEPTH_SIZE, 24,
-    GLX_DOUBLEBUFFER,
-    None
-  ]
+    let screen = XDefaultScreen(display)
+    var glxMajor, glxMinor: cint
 
-  var vi = glXChooseVisual(display, 0, addr attrs[0])
-  if vi == nil:
-    quit "No appropriate visual found"
+    if (not glXQueryVersion(display, glxMajor, glxMinor).bool or
+        (glxMajor == 1.cint and glxMinor < 3.cint) or
+        (glxMajor < 1.cint)):
+      quit "Invalid GLX version. Expected >=1.3"
+    echo("GLX version ", glxMajor, ".", glxMinor)
+    echo("GLX extension: ", glXQueryExtensionsString(display, screen))
 
+    var attrs = [
+      GLX_RGBA,
+      GLX_DEPTH_SIZE, 24,
+      GLX_DOUBLEBUFFER,
+      None
+    ]
 
-  echo "Visual ", vi.visualid, " selected"
-  var swa: XSetWindowAttributes
-  swa.colormap = XCreateColormap(display, DefaultRootWindow(display),
-                                 vi.visual, AllocNone)
-  swa.event_mask = ButtonPressMask or ButtonReleaseMask or
-                   KeyPressMask or KeyReleaseMask or
-                   PointerMotionMask or ExposureMask or ClientMessage
-  if not windowed:
-    swa.override_redirect = 1
-    swa.save_under = 1
+    var vi = glXChooseVisual(display, 0, addr attrs[0])
+    if vi == nil:
+      quit "No appropriate visual found"
+    echo "Visual ", vi.visualid, " selected"
 
-  var attributes: XWindowAttributes
-  discard XGetWindowAttributes(
-    display,
-    DefaultRootWindow(display),
-    addr attributes)
-  var win = XCreateWindow(
-    display, DefaultRootWindow(display),
-    0, 0, attributes.width.cuint, attributes.height.cuint, 0,
-    vi.depth, InputOutput, vi.visual,
-    CWColormap or CWEventMask or CWOverrideRedirect or CWSaveUnder, addr swa)
+    var swa: XSetWindowAttributes
+    swa.colormap = XCreateColormap(display, DefaultRootWindow(display),
+                                  vi.visual, AllocNone)
+    swa.event_mask = ButtonPressMask or ButtonReleaseMask or
+                    KeyPressMask or KeyReleaseMask or
+                    PointerMotionMask or ExposureMask or ClientMessage
+    if not windowed:
+      swa.override_redirect = 1
+      swa.save_under = 1
 
-  discard XMapWindow(display, win)
+    var attributes: XWindowAttributes
+    discard XGetWindowAttributes(
+      display,
+      DefaultRootWindow(display),
+      addr attributes)
 
-  var wmName = "boomer"
-  var wmClass = "Boomer"
-  var hints = XClassHint(res_name: wmName, res_class: wmClass)
+    winW = attributes.width
+    winH = attributes.height
 
-  discard XStoreName(display, win, wmName)
-  discard XSetClassHint(display, win, addr(hints))
+    win = XCreateWindow(
+      display, DefaultRootWindow(display),
+      0, 0, winW.cuint, winH.cuint, 0,
+      vi.depth, InputOutput, vi.visual,
+      CWColormap or CWEventMask or CWOverrideRedirect or CWSaveUnder, addr swa)
 
-  var wmDeleteMessage = XInternAtom(
-    display, "WM_DELETE_WINDOW",
-    0.cint)
+    discard XMapWindow(display, win)
 
-  discard XSetWMProtocols(display, win,
-                          addr wmDeleteMessage, 1)
+    var wmName = "boomer"
+    var wmClass = "Boomer"
+    var hints = XClassHint(res_name: wmName, res_class: wmClass)
 
-  var glc = glXCreateContext(display, vi, nil, GL_TRUE.cint)
-  discard glXMakeCurrent(display, win, glc)
+    discard XStoreName(display, win, wmName)
+    discard XSetClassHint(display, win, addr(hints))
 
-  loadExtensions()
+    wmDeleteMessage = XInternAtom(
+      display, "WM_DELETE_WINDOW",
+      0.cint)
+
+    discard XSetWMProtocols(display, win,
+                            addr wmDeleteMessage, 1)
+
+    glc = glXCreateContext(display, vi, nil, GL_TRUE.cint)
+    discard glXMakeCurrent(display, win, glc)
+
+    loadExtensions()
+
+    discard XGetInputFocus(display, addr originWindow, addr revertToReturn)
 
   var shaderProgram = newShaderProgram(vertexShader, fragmentShader)
 
   var screenshot =
     if backend == cbPortal:
-      newPortalScreenshot()
+      newPortalScreenshot(windowed)
     else:
       newX11Screenshot(display, trackingWindow)
   defer: screenshot.destroy(display)
@@ -465,176 +567,280 @@ proc main() =
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER)
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER)
+  
+  echo "width (screenshot, screen): ", screenshot.image.width, " ", winW
+  echo "height (screenshot, screen): ", screenshot.image.height, " ", winH
+  let initialScale =
+    if backend == cbPortal:
+      max(winW.float32 / screenshot.image.width.float32,
+          winH.float32 / screenshot.image.height.float32) 
+    else:
+      1.0
 
   var
     quitting = false
-    camera = Camera(scale: 1.0)
+    camera = Camera(scale: initialScale)
     mouse: Mouse =
       block:
-        let pos = getCursorPosition(display)
+        let pos =
+          if backend == cbPortal: getCursorPositionSDL()
+          else:                   getCursorPosition(display)
         Mouse(curr: pos, prev: pos)
-    flashlight = Flashlight(
-      isEnabled: false,
-      radius: 200.0)
+    flashlight = Flashlight(isEnabled: false, radius: 200.0)
     mirror = false
+ 
+  let dt = 1.0 / rate
+  
+  if backend == cbPortal:  # sdl2 event loop
+    while not quitting:
+      var w, h: cint  # window size
+      sdl2.getSize(sdlWindow, w, h)
 
-  let dt = 1.0 / rate.float
-  var originWindow: Window
-  var revertToReturn: cint
-  discard XGetInputFocus(display, addr originWindow, addr revertToReturn)
-  while not quitting:
-    # TODO(#78): Is there a better solution to keep the focus always on the window?
-    if not windowed:
-      discard XSetInputFocus(display, win, RevertToParent, CurrentTime);
+      var winRect: sdl2.Rect
+      var renderer: sdl2.RendererPtr = sdl2.getRenderer(sdlWindow)
+      sdl2.getViewport(renderer, winRect)
+      # echo "viewport: ", winRect.x, " ", winRect.y, " ", winRect.w, " ", winRect.h
 
-    var wa: XWindowAttributes
-    discard XGetWindowAttributes(display, win, addr wa)
-    glViewport(0, 0, wa.width, wa.height)
-
-    var xev: XEvent
-    while XPending(display) > 0:
-      discard XNextEvent(display, addr xev)
-
+      glViewport(0, 0, w, h)
+      let windowSize = vec2(w.float32, h.float32)
+ 
       proc scrollUp() =
-        if (xev.xkey.state and ControlMask) > 0.uint32 and flashlight.isEnabled:
+        if (sdl2.getModState() and KMOD_CTRL) != 0 and flashlight.isEnabled:
           flashlight.deltaRadius += INITIAL_FL_DELTA_RADIUS
         else:
           camera.deltaScale += config.scrollSpeed
           camera.scalePivot = mouse.curr
-
+ 
       proc scrollDown() =
-        if (xev.xkey.state and ControlMask) > 0.uint32 and flashlight.isEnabled:
+        if (sdl2.getModState() and KMOD_CTRL) != 0 and flashlight.isEnabled:
           flashlight.deltaRadius -= INITIAL_FL_DELTA_RADIUS
         else:
           camera.deltaScale -= config.scrollSpeed
           camera.scalePivot = mouse.curr
-
-      case xev.theType
-      of Expose:
-        discard
-
-      of MotionNotify:
-        mouse.curr = vec2(xev.xmotion.x.float32,
-                          xev.xmotion.y.float32)
-
-        if mouse.drag:
-          let delta = world(camera, mouse.prev) - world(camera, mouse.curr)
-          camera.position += delta
-          # delta is the distance the mouse traveled in a single
-          # frame. To turn the velocity into units/second we need to
-          # multiple it by FPS.
-          camera.velocity = delta * rate.float
-
-        mouse.prev = mouse.curr
-
-      of ClientMessage:
-        if cast[Atom](xev.xclient.data.l[0]) == wmDeleteMessage:
+ 
+      var ev: sdl2.Event
+      while sdl2.pollEvent(ev):
+        case ev.kind
+ 
+        of QuitEvent:
           quitting = true
-
-      of KeyPress:
-        var key = XLookupKeysym(cast[PXKeyEvent](xev.addr), 0)
-        case key
-        of XK_EQUAL: scrollUp()
-        of XK_MINUS: scrollDown()
-        of XK_0:
-          camera.scale = 1.0
-          camera.deltaScale = 0.0
-          camera.position = vec2(0.0'f32, 0.0)
-          camera.velocity = vec2(0.0'f32, 0.0)
-          mirror = false
-        of XK_q, XK_Escape:
-          quitting = true
-        of XK_r:
-          if configFile.len > 0 and fileExists(configFile):
-            config = loadConfig(configFile)
-
-          when defined(developer):
-            if (xev.xkey.state and ControlMask) > 0.uint32:
-              echo "------------------------------"
-              echo "RELOADING SHADERS"
-              try:
-                reloadShader(vertexShader)
-                reloadShader(fragmentShader)
-                let newShaderProgram = newShaderProgram(vertexShader, fragmentShader)
-                glDeleteProgram(shaderProgram)
-                shaderProgram = newShaderProgram
-                echo "Shader program ID: ", shaderProgram
-              except GLerror:
-                echo "Could not reload the shaders"
-              echo "------------------------------"
-
-        of XK_m:
-          camera.position[0] += screenshot.image.width.float/camera.scale - 2*(mouse.curr[0]/camera.scale + camera.position[0])
-          mirror = not mirror
-
-        of XK_f:
-          flashlight.isEnabled = not flashlight.isEnabled
-        else:
-          discard
-
-      of ButtonPress:
-        case xev.xbutton.button
-        of Button1:
+ 
+        of MouseMotion:
+          let mm = ev.motion
+          mouse.curr = vec2(mm.x.float32, mm.y.float32)
+          if mouse.drag:
+            let delta = world(camera, mouse.prev) - world(camera, mouse.curr)
+            camera.position += delta
+            camera.velocity  = delta * rate
           mouse.prev = mouse.curr
-          mouse.drag = true
-          camera.velocity = vec2(0.0, 0.0)
-        of Button4: scrollUp()
-        of Button5: scrollDown()
-        else:
-          discard
-
-      of ButtonRelease:
-        case xev.xbutton.button
-        of Button1:
-          mouse.drag = false
-        else:
-          discard
-      else:
+ 
+        of MouseButtonDown:
+          case ev.button.button
+          of BUTTON_LEFT:
+            mouse.prev = mouse.curr
+            mouse.drag = true
+            camera.velocity = vec2(0.0, 0.0)
+          of BUTTON_X1: scrollUp()     # some mice map extra buttons here;
+          of BUTTON_X2: scrollDown()   # wheel is handled via MouseWheel below
+          else: discard
+ 
+        of MouseButtonUp:
+          if ev.button.button == BUTTON_LEFT:
+            mouse.drag = false
+ 
+        of MouseWheel:
+          # SDL2 delivers wheel as a MouseWheel event, not ButtonPress 4/5
+          if ev.wheel.y > 0: scrollUp()
+          elif ev.wheel.y < 0: scrollDown()
+ 
+        of KeyDown:
+          let sym = ev.key.keysym.sym
+          case sym
+          of K_EQUALS, K_KP_PLUS:  scrollUp()
+          of K_MINUS,  K_KP_MINUS: scrollDown()
+          of K_0, K_KP_0:
+            camera.scale = 1.0
+            camera.deltaScale = 0.0
+            camera.position = vec2(0.0'f32, 0.0)
+            camera.velocity = vec2(0.0'f32, 0.0)
+            mirror = false
+          of K_q, K_ESCAPE:
+            quitting = true
+          of K_r:
+            if configFile.len > 0 and fileExists(configFile):
+              config = loadConfig(configFile)
+            when defined(developer):
+              if (sdl2.getModState() and KMOD_CTRL) != 0:
+                echo "------------------------------"
+                echo "RELOADING SHADERS"
+                try:
+                  reloadShader(vertexShader)
+                  reloadShader(fragmentShader)
+                  let newProg = newShaderProgram(vertexShader, fragmentShader)
+                  glDeleteProgram(shaderProgram)
+                  shaderProgram = newProg
+                  echo "Shader program ID: ", shaderProgram
+                except GLerror:
+                  echo "Could not reload the shaders"
+                echo "------------------------------"
+          of K_m:
+            camera.position[0] += screenshot.image.width.float/camera.scale - 2*(mouse.curr[0]/camera.scale + camera.position[0])
+            mirror = not mirror
+          of K_f:
+            flashlight.isEnabled = not flashlight.isEnabled
+          else: discard
+ 
+        else: discard
+ 
+      camera.update(config, dt, mouse, screenshot.image, windowSize)
+      flashlight.update(dt)
+ 
+      screenshot.image.draw(camera, shaderProgram, vao, texture,
+                            windowSize, mouse, flashlight, mirror)
+ 
+      sdl2.glSwapWindow(sdlWindow)
+      glFinish()
+ 
+      # live refresh is X11-only, not allowed by portal / wayland policy
+      when defined(live):
         discard
+ 
+    sdl2.glDeleteContext(sdlGlCtx)
+    sdl2.destroyWindow(sdlWindow)
+    sdl2.quit()
 
-    camera.update(config, dt, mouse, screenshot.image,
-                  vec2(wa.width.float32, wa.height.float32))
-    flashlight.update(dt)
-
-    screenshot.image.draw(camera, shaderProgram, vao, texture,
-                          vec2(wa.width.float32, wa.height.float32),
-                          mouse, flashlight, mirror)
-
-    glXSwapBuffers(display, win)
-    glFinish()
-
-    when defined(live):
-      screenshot.refresh(display, trackingWindow)
-      # TODO(#90): don't update the vbo on screenshot refresh
-      # I'm pretty sure we can avoid that if we make independent from
-      # the size of the window as it was in the beginning. (I simply did
-      # not expect this use case back then Kappa)
-      var
-        w = screenshot.image.width.float32
-        h = screenshot.image.height.float32
-        vertices = [
-          # Position                 Texture coords
-          [GLfloat    w,     0, 0.0, 1.0, 1.0], # Top right
-          [GLfloat    w,     h, 0.0, 1.0, 0.0], # Bottom right
-          [GLfloat    0,     h, 0.0, 0.0, 0.0], # Bottom left
-          [GLfloat    0,     0, 0.0, 0.0, 1.0]  # Top left
-        ]
-        indices = [GLuint(0), 1, 3,
-                   1,  2, 3]
-      glBindBuffer(GL_ARRAY_BUFFER, vbo)
-      glBufferData(GL_ARRAY_BUFFER, size = GLsizeiptr(sizeof(vertices)),
-                   addr vertices, GL_STATIC_DRAW)
-      glTexImage2D(GL_TEXTURE_2D,
-                   0,
-                   GL_RGB.GLint,
-                   screenshot.image.GLsizei,
-                   screenshot.image.GLsizei,
-                   0,
-                   # TODO(#13): the texture format is hardcoded
-                   glFormat(screenshot.image.pixelFormat),
-                   GL_UNSIGNED_BYTE,
-                   screenshot.image.dataPtr)
-  discard XSetInputFocus(display, originWindow, RevertToParent, CurrentTime);
-  discard XSync(display, 0)
+  else: # x11 event loop
+    while not quitting: 
+      # TODO(#78): Is there a better solution to keep the focus always on the window?
+      if not windowed:
+        discard XSetInputFocus(display, win, RevertToParent, CurrentTime)
+ 
+      var wa: XWindowAttributes
+      discard XGetWindowAttributes(display, win, addr wa)
+      glViewport(0, 0, wa.width, wa.height)
+ 
+      var xev: XEvent
+      while XPending(display) > 0:
+        discard XNextEvent(display, addr xev)
+ 
+        proc scrollUp() =
+          if (xev.xkey.state and ControlMask) > 0.uint32 and flashlight.isEnabled:
+            flashlight.deltaRadius += INITIAL_FL_DELTA_RADIUS
+          else:
+            camera.deltaScale += config.scrollSpeed
+            camera.scalePivot = mouse.curr
+ 
+        proc scrollDown() =
+          if (xev.xkey.state and ControlMask) > 0.uint32 and flashlight.isEnabled:
+            flashlight.deltaRadius -= INITIAL_FL_DELTA_RADIUS
+          else:
+            camera.deltaScale -= config.scrollSpeed
+            camera.scalePivot = mouse.curr
+ 
+        case xev.theType
+        of Expose:
+          discard
+ 
+        of MotionNotify:
+          mouse.curr = vec2(xev.xmotion.x.float32, xev.xmotion.y.float32)
+          if mouse.drag:
+            let delta = world(camera, mouse.prev) - world(camera, mouse.curr)
+            camera.position += delta
+            camera.velocity  = delta * rate.float
+          mouse.prev = mouse.curr
+ 
+        of ClientMessage:
+          if cast[Atom](xev.xclient.data.l[0]) == wmDeleteMessage:
+            quitting = true
+ 
+        of KeyPress:
+          var key = XLookupKeysym(cast[PXKeyEvent](xev.addr), 0)
+          case key
+          of XK_EQUAL:  scrollUp()
+          of XK_MINUS:  scrollDown()
+          of XK_0:
+            camera.scale    = 1.0
+            camera.deltaScale = 0.0
+            camera.position = vec2(0.0'f32, 0.0)
+            camera.velocity = vec2(0.0'f32, 0.0)
+            mirror = false
+          of XK_q, XK_Escape:
+            quitting = true
+          of XK_r:
+            if configFile.len > 0 and fileExists(configFile):
+              config = loadConfig(configFile)
+            when defined(developer):
+              if (xev.xkey.state and ControlMask) > 0.uint32:
+                echo "------------------------------"
+                echo "RELOADING SHADERS"
+                try:
+                  reloadShader(vertexShader)
+                  reloadShader(fragmentShader)
+                  let newShaderProgram = newShaderProgram(vertexShader, fragmentShader)
+                  glDeleteProgram(shaderProgram)
+                  shaderProgram = newShaderProgram
+                  echo "Shader program ID: ", shaderProgram
+                except GLerror:
+                  echo "Could not reload the shaders"
+                echo "------------------------------"
+          of XK_m:
+            camera.position[0] += screenshot.image.width.float/camera.scale -
+                                   2*(mouse.curr[0]/camera.scale + camera.position[0])
+            mirror = not mirror
+          of XK_f:
+            flashlight.isEnabled = not flashlight.isEnabled
+          else: discard
+ 
+        of ButtonPress:
+          case xev.xbutton.button
+          of Button1:
+            mouse.prev = mouse.curr
+            mouse.drag = true
+            camera.velocity = vec2(0.0, 0.0)
+          of Button4: scrollUp()
+          of Button5: scrollDown()
+          else: discard
+ 
+        of ButtonRelease:
+          case xev.xbutton.button
+          of Button1: mouse.drag = false
+          else: discard
+        else: discard
+ 
+      camera.update(config, dt, mouse, screenshot.image,
+                    vec2(wa.width.float32, wa.height.float32))
+      flashlight.update(dt)
+ 
+      screenshot.image.draw(camera, shaderProgram, vao, texture,
+                            vec2(wa.width.float32, wa.height.float32),
+                            mouse, flashlight, mirror)
+ 
+      glXSwapBuffers(display, win)
+      glFinish()
+ 
+      when defined(live):
+        screenshot.refresh(display, trackingWindow)
+        var
+          w = screenshot.image.width.float32
+          h = screenshot.image.height.float32
+          vertices = [
+            [GLfloat    w,     0, 0.0, 1.0, 1.0],
+            [GLfloat    w,     h, 0.0, 1.0, 0.0],
+            [GLfloat    0,     h, 0.0, 0.0, 0.0],
+            [GLfloat    0,     0, 0.0, 0.0, 1.0]
+          ]
+          indices = [GLuint(0), 1, 3, 1, 2, 3]
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        glBufferData(GL_ARRAY_BUFFER, size = GLsizeiptr(sizeof(vertices)),
+                     addr vertices, GL_STATIC_DRAW)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB.GLint,
+                     screenshot.image.width.GLsizei, screenshot.image.height.GLsizei, 0,
+                     glFormat(screenshot.image.pixelFormat),
+                     GL_UNSIGNED_BYTE, screenshot.image.dataPtr)
+ 
+    
+    discard XSetInputFocus(display, originWindow, RevertToParent, CurrentTime)
+    discard XSync(display, 0)
+    discard XCloseDisplay(display)
 
 main()

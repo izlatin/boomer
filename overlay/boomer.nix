@@ -1,4 +1,4 @@
-{ stdenv, lib, fetchFromGitHub, nim-2_0, libX11, libXrandr, libGL }:
+{ stdenv, lib, fetchFromGitHub, nim-2_0, libX11, libXrandr, libGL, SDL2 }:
 
 let
   x11-nim = fetchFromGitHub {
@@ -19,6 +19,12 @@ let
     rev = "ba5f45286bfa9bed93d8d6b941949cd6218ec888";
     sha256 = "sha256-3xeqUumBOxuXsikgcETp5oe1GAw8jyhP3ZSpm0+Imo0=";
   };
+  sdl2-nim = fetchFromGitHub {
+    owner = "nim-lang";
+    repo = "sdl2";
+    rev = "c878475e04fcdc207985587ea61b2387f18b7b8c";
+    sha256 = "sha256-H1PBTRN17LcET0FO5hdYl2qiQeGMEpoYqwLK8YgWchM=";
+  };
 in stdenv.mkDerivation rec {
   pname = "boomer";
   version = "unstable-2026-05-28";
@@ -29,10 +35,10 @@ in stdenv.mkDerivation rec {
   #   sha256 = "1g0y93wqm5j41fp5938z831zcnx9958l1crqyc1w0ygg8hahfb5q";
   # };
   src = ../.;
-  buildInputs = [ nim-2_0 libX11 libXrandr libGL ];
+  buildInputs = [ nim-2_0 libX11 libXrandr libGL SDL2 ];
   buildPhase = ''
     HOME=$TMPDIR
-    nim -p:${x11-nim}/ -p:${opengl-nim}/src -p:${stb_image-nim}/ c -d:release src/boomer.nim
+    nim -p:${x11-nim}/ -p:${opengl-nim}/src -p:${stb_image-nim}/ -p:${sdl2-nim}/src c -d:release src/boomer.nim
   '';
   installPhase = "install -Dt $out/bin src/boomer";
   fixupPhase = ''
@@ -42,6 +48,7 @@ in stdenv.mkDerivation rec {
       libX11
       libXrandr
       libGL
+      SDL2
     ]
   } $out/bin/boomer
 '';
