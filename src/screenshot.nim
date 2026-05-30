@@ -151,7 +151,9 @@ proc captureWithPortal(cmd: PortalCommand, windowed: bool = false): ImageBuffer 
       try: removeFile(tempPath)
       except CatchableError: discard
 
-    var args = @["-b", "-n", "-o", tempPath]
+    # -i launches a new instance of spectacle
+    # if you do a screencast with spectacle at the same time, it won't stop the recording
+    var args = @["-b", "-n", "-o", tempPath, "-i"]
     if windowed:
       args.add("-m")
     let exitCode = execAndWait(cmd.path, args)
