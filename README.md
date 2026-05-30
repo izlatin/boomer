@@ -1,3 +1,18 @@
+## Wayland
+1. Added some support for Wayland, including key control, since X11 has a completely different event loop for that. Many other forks try to make Boomer work on wayland, but I have tested several of them and none of them worked by me as good as original (probably depends on the desktop environment). The screenshot functionality extension is taken from [this fork](https://github.com/gnshb/boomer), so you can install a screenshot helper that works with your compositor (one of the following is enough):
+
+- `grim` (wlroots compositors; requires `xdg-desktop-portal-wlr`)
+- `gnome-screenshot` (GNOME)
+- `spectacle` (KDE Plasma) &nbsp; *[I have tested only this one so far]*
+
+2. Added offset parameters to the Boomer config for such cases like having a kDE Plasma side panel that sometimes places a new window with an offset to not overlap with itself. 
+3. Updated the installation config for Nix
+### Challenges
+Wayland protocol does not give as much freedom as provided by X11, so the following problems are still not solved:
+
+- **Multiple monitors:** fullscreen mode (default) opens properly only when launched from the top left monitor
+- **System scaling:** if some of your displays have a system scale ($\neq$ 100%) set up, then the overlay might have an incorrect size 
+
 [![Tsoding](https://img.shields.io/badge/twitch.tv-tsoding-purple?logo=twitch&style=for-the-badge)](https://www.twitch.tv/tsoding)
 [![Build Status](https://travis-ci.org/tsoding/boomer.svg?branch=master)](https://travis-ci.org/tsoding/boomer)
 
@@ -75,6 +90,8 @@ Supported parameters:
 | scale_friction | How quickly the zoom slows down after scrolling    |
 | offset_x       | Offset for the screenshot (pixels on the right)    |
 | offset_y       | Offset for the screenshot (pixels on top)          |
+
+If you have a KDE Plasma panel that places all windows with an offset by default, you can find its thickness in pixels and put it into the Boomer config, so that it shifts the overlay properly.
 
 ## Experimental Features Compilation Flags
 
