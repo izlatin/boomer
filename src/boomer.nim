@@ -17,7 +17,6 @@ import math
 import options
 
 import sdl2
-# import sdl2/syswm
 
 type Shader = tuple[path, content: string]
 
@@ -115,7 +114,6 @@ proc draw(screenshot: ImageBuffer, camera: Camera, shader, vao, texture: GLuint,
   glClear(GL_COLOR_BUFFER_BIT or GL_DEPTH_BUFFER_BIT)
 
   glUseProgram(shader)
-
   glUniform2f(glGetUniformLocation(shader, "cameraPos".cstring), camera.position[0], camera.position[1])
   glUniform1f(glGetUniformLocation(shader, "cameraScale".cstring), camera.scale)
   glUniform2f(glGetUniformLocation(shader, "screenshotSize".cstring),
@@ -238,9 +236,7 @@ proc getWindowGeometrySDL(x, y, w, h: var int) =
   echo "window geometry: $1 $2 $3 $4" % [$x, $y, $w, $h]
 
 proc mainShared(shaderProgram: var GLuint, screenshot: Screenshot, texture: var GLuint,
-                vao, vbo, ebo: var Gluint,
-                windowed: bool, winW, winH: int, rate: float32,
-                display: PDisplay, trackingWindow: Window)=
+                vao, vbo, ebo: var Gluint)=
   shaderProgram = newShaderProgram(vertexShader, fragmentShader)
 
   let w = screenshot.image.width.float32
@@ -301,9 +297,6 @@ proc mainShared(shaderProgram: var GLuint, screenshot: Screenshot, texture: var 
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER)
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER)
-  
-  # echo "width (screenshot, screen): ", screenshot.image.width, " ", winW
-  # echo "height (screenshot, screen): ", screenshot.image.height, " ", winH
  
 proc mainPortal(config: Config, configFile: var string, windowed: bool) =
   var 
@@ -326,13 +319,15 @@ proc mainPortal(config: Config, configFile: var string, windowed: bool) =
   discard sdl2.glSetAttribute(SDL_GL_GREEN_SIZE,    8)
   discard sdl2.glSetAttribute(SDL_GL_BLUE_SIZE,     8)
 
+  var displayIndex = 0.cint
   var dm: sdl2.DisplayMode
-  if sdl2.getDesktopDisplayMode(0, dm) != SdlSuccess:
+  if sdl2.getDesktopDisplayMode(displayIndex, dm) != SdlSuccess:
     quit "SDL2 getDesktopDisplayMode failed: " & $sdl2.getError()
   rate = if dm.refresh_rate > 0: dm.refresh_rate.float32 else: 60.0
 
   # compute bounding box across all outputs
-  # TODO: fix for more than one monitor (cannot really get current display)
+  # TODO: fix for more than one monitor (cannot really get global display coords)
+  # (0,0) on wayland always corresponds to the current display
   var winX, winY = 0
   if windowed:
     winW = dm.w
@@ -343,7 +338,7 @@ proc mainPortal(config: Config, configFile: var string, windowed: bool) =
   # SDL_WINDOW_FULLSCREEN_DESKTOP is per-output on Wayland and cannot span
   # monitors. Use a borderless window at the full desktop geometry instead.
   let flags =
-    if windowed: SDL_WINDOW_OPENGL or SDL_WINDOW_RESIZABLE
+    if windowed: SDL_WINDOW_OPENGL or SDL_WINDOW_RESIZABLE or SDL_WINDOW_BORDERLESS
     else:        SDL_WINDOW_OPENGL or SDL_WINDOW_BORDERLESS
 
   sdlWindow = sdl2.createWindow(
@@ -353,6 +348,8 @@ proc mainPortal(config: Config, configFile: var string, windowed: bool) =
     flags)
   if sdlWindow == nil:
     quit "SDL2 createWindow failed: " & $sdl2.getError()
+
+  # var displayIndex = sdl2.getDisplayIndex(sdlWindow)
 
   sdlGlCtx = sdl2.glCreateContext(sdlWindow)
   if sdlGlCtx == nil:
@@ -366,6 +363,10 @@ proc mainPortal(config: Config, configFile: var string, windowed: bool) =
   #_____ SHARED MAIN called_____
   var shaderProgram: GLuint
   var screenshot = newPortalScreenshot(windowed)
+
+  # echo "width (screenshot, screen): ", screenshot.image.width, " ", winW
+  # echo "height (screenshot, screen): ", screenshot.image.height, " ", winH
+
   defer: screenshot.destroy(nil)
 
   var vao, vbo, ebo: GLuint
@@ -373,8 +374,7 @@ proc mainPortal(config: Config, configFile: var string, windowed: bool) =
 
   var trackingWindow: Window # to match the mainShared signature
   mainShared(shaderProgram, screenshot, texture, 
-             vao, vbo, ebo,
-             windowed, winW, winH, rate, nil, trackingWindow)
+             vao, vbo, ebo)
   defer:
     glDeleteVertexArrays(1, addr vao)
     glDeleteBuffers(1, addr vbo)
@@ -393,14 +393,22 @@ proc mainPortal(config: Config, configFile: var string, windowed: bool) =
     mirror = false
 
   let dt = 1.0 / rate
-
+  
   #_____ EVENT LOOP_____
   while not quitting:
-    var w, h: cint  # window size
-    sdl2.getSize(sdlWindow, w, h)
-
-    glViewport(-config.offsetX.cint, -config.offsetY.cint, w, h)
-    let windowSize = vec2(w.float32, h.float32)
+    var curDisplayIndex = sdl2.getDisplayIndex(sdlWindow)
+    if curDisplayIndex != displayIndex:
+      displayIndex = curDisplayIndex
+      discard sdl2.getDesktopDisplayMode(displayIndex, dm)
+      rate = if dm.refresh_rate > 0: dm.refresh_rate.float32 else: 60.0
+      if windowed:
+        winW = dm.w
+        winH = dm.h
+      sdl2.setSize(sdlWindow, winW.cint, winH.cint)
+      camera.scale = max(winW.float32 / screenshot.image.width.float32,
+                         winH.float32 / screenshot.image.height.float32)
+    glViewport(-config.offsetX.cint, -config.offsetY.cint, winW.GLsizei, winH.GLsizei)
+    let windowSize = vec2(winW.float32, winH.float32)
 
     proc scrollUp() =
       if (sdl2.getModState() and KMOD_CTRL) != 0 and flashlight.isEnabled:
@@ -616,8 +624,7 @@ proc mainX11(config: Config, configFile: var string, windowed: bool) =
   var vao, vbo, ebo : Gluint
   var texture = 0.GLuint
   mainShared(shaderProgram, screenshot, texture,
-             vao, vbo, ebo,
-             windowed, winW, winH, rate, nil, trackingWindow)
+             vao, vbo, ebo)
   defer:
     glDeleteVertexArrays(1, addr vao)
     glDeleteBuffers(1, addr vbo)
